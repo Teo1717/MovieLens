@@ -1,0 +1,389 @@
+---
+title: "MovieLens Report"
+author: "Teo Fernandes"
+date: "2023-03-19"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE}
+load(file = "edx.Rds")
+load(file = "holdout.Rds")
+rawedx <- edx
+rawholdout <- final_holdout_test
+```
+
+# Libraries
+
+```{r, message = FALSE, warnings = FALSE}
+library(lubridate)
+library(tidyverse)
+library(caret)
+library(recommenderlab)
+library(Matrix)
+library(xgboost)
+library(fastDummies)
+```
+
+# 1. Introduction
+
+The goal of this project is to predict a rating based on following
+features:
+
+-   movieId
+
+-   userId
+
+-   timestamp
+
+-   title
+
+-   genres
+
+We will use the movieLens dataset
+
+## Presentation of the dataset
+
+We can compute some summaries: Dataset dimensions
+
+```{r, message = FALSE}
+dim(edx)
+```
+
+Structure of the dataset
+
+```{r, message = FALSE}
+str(edx)
+```
+
+Number of differents genres:
+
+```{r, warning = FALSE}
+edx %>% mutate(genres = as.factor(genres)) %>% summarise(levels(genres)) %>% nrow()
+```
+
+Frequencies for each genres :
+
+```{r, message = FALSE}
+genres_freq <- edx %>% group_by(genres) %>% summarise(freq = n()/nrow(edx)) %>% arrange(desc(freq))
+
+genres_freq %>% top_n(20)
+```
+
+Principal Genres :
+
+```{r, message = FALSE}
+edx <- edx %>% mutate(maingenres = str_match(genres, "(\\w*)\\|*")[,2] %>% as.factor)
+final_holdout_test <- final_holdout_test %>% mutate(maingenres = str_match(genres, "(\\w*)\\|*")[,2] %>% as.factor)
+
+head(edx)
+```
+
+Frequencies for each movies :
+
+```{r, message = FALSE}
+movies_freq <- edx %>% group_by(title) %>% summarise(freq = n() / nrow(edx)) %>% arrange(desc(freq))
+
+movies_freq %>% top_n(20)
+```
+
+Frequencies for each user :
+
+```{r, message = FALSE}
+users_freq <- edx %>% group_by(userId) %>% summarise(freq = n() / nrow(edx)) %>% 
+  arrange(desc(freq))
+
+users_freq %>% top_n(20)
+```
+
+Frequencies for each timestamp (year):
+
+```{r, message = FALSE}
+edx <- edx %>% mutate(stampyear = as_datetime(timestamp) %>% year)
+year_freq <- edx %>% group_by(stampyear) %>% summarise(freq = n() / nrow(edx)) %>% 
+  arrange(desc(freq))
+
+year_freq %>% top_n(20)
+```
+
+Frequencies for each timestamp (month):
+
+```{r, message = FALSE}
+edx <- edx %>% mutate(stampmonth = as_datetime(timestamp) %>% month) %>% group_by(stampmonth) 
+month_freq <- edx %>% summarise(freq = n() / nrow(edx)) %>% 
+  arrange(desc(freq))
+
+month_freq %>% top_n(20)
+```
+
+We notice that the movie year is mentioned in the title, we will extract
+it. First we will add the movie year to the edx data set. Then we
+compute the frequencies summary.
+
+```{r, message = FALSE}
+edx <- edx %>% mutate(movieyear = str_match(title,"\\((\\d{4})\\)")[,2] %>% as.numeric)
+final_holdout_test <- final_holdout_test %>% mutate(movieyear = str_match(title,"\\((\\d{4})\\)")[,2] %>% as.numeric)
+
+movie_year_freq <- edx %>% group_by(movieyear) %>% summarise(freq = n() / nrow(edx)) %>%
+  arrange(desc(freq))
+
+movie_year_freq %>% top_n(20)
+```
+
+We can calculate the difference between the rating year and the movie
+year.
+
+```{r, message = FALSE}
+edx <- edx %>% mutate(diff = stampyear - movieyear)
+diff_freq <- edx %>% group_by(diff) %>% summarise(freq = n() / nrow(edx)) %>%
+  arrange(desc(freq))
+
+diff_freq %>% top_n(20)
+```
+
+We can check for the frequencies of rating
+
+```{r}
+hist(edx$rating, main = "Rating Frequencies", xlab = "Rating")
+```
+
+We can check if there is missing value.
+
+```{r}
+anyNA(edx)
+```
+
+# 2. Method, Analysis
+
+The response variable is the rating that ranges from 0.5 to 5, with a
+0.5 step.
+
+```{r, message = FALSE}
+edx$rating %>% as_factor() %>% levels()
+```
+
+We can weither see it as a regression task, where the rating is
+continuous. Or as a classification task with 8 category.
+
+For this project, we will use the regression approach. We therefore
+define the error measurement with the RMSE.
+
+```{r}
+RMSE <- function(true, predicted){
+  sqrt(mean((true - predicted) ^ 2))
+}
+```
+
+Before we start the modelling, we will add some features to the test set
+that we already in the introduction to the train set
+
+```{r}
+final_holdout_test <- final_holdout_test %>%
+  mutate(movieyear = str_match(title,"\\((\\d{4})\\)")[,2] %>% as.numeric) %>%
+  mutate(stampmonth = as_datetime(timestamp) %>% month) %>%
+  mutate(stampyear = as_datetime(timestamp) %>% year) %>%
+  mutate(diff = stampyear - movieyear)
+```
+
+## Sampling the dataset
+
+Since we also have 9 millions observations in the training set. It can
+be interesting to sample it to reduce the models computation time.
+
+```{r}
+set.seed(1)
+subedx <- slice_sample(edx2, n = 10000)
+```
+
+We verify that the sample is not biased To do so, we can use
+Kolmogorov-Smirnov test for the continuous variables and the Pearson's
+chi-square test for the categorical variables.
+
+For the continuous variables:
+
+```{r, warning = FALSE, message = FALSE}
+ks.test(subedx$userId, edx2$userId)
+ks.test(subedx$movieId, edx2$movieId)
+ks.test(subedx$rating, edx2$rating)
+ks.test(subedx$timestamp, edx2$timestamp)
+```
+
+All the p-values are higher than 0.05. The sampling is significant for
+these variables
+
+For the categorical variables:
+
+```{r, message = FALSE, warning = FALSE}
+
+chisq.test(table(subedx$genres) %>% cbind(table(edx$genres)))
+```
+
+The p-value is smaller than 0.05. The sampling isn't significant for the
+genres variable. We won't use it for the model training on the sample.
+
+We can define a function that tests if the sample follow the same
+distribution as the parent population.
+
+```{r}
+testing <- function(sample){
+  variables_numeric <- names(edx)[sapply(edx, is.numeric)]
+  variable_cat <- names(edx)[!sapply(edx, is.numeric)]
+  testN <- sapply(variables_numeric, function(col){
+    ks.test(edx[,col], sample[,col])$p.value
+  }) 
+  testC <- sapply(variable_cat, function(col){
+    chisq.test(table(edx[,col]) %>% cbind(table(sample[,col])))$p.value
+  }) 
+  return(any(testC <= 0.05) | any(testN <= 0.05))
+}
+```
+
+## Constant Model
+
+The first model, we will consider is with the overall mean rating.
+
+```{r, eval = FALSE}
+model_constant <- lm(rating ~ 1, data = edx)
+rmse_constant <- RMSE(predict(model_constant, newdata = final_holdout_test), final_holdout_test$rating)
+```
+
+## Linear Model
+
+Second model will a linear regression that will allow an understandable
+results
+
+```{r, eval = FALSE}
+model_linear <- lm(rating ~ userId + movieId + movieyear +
+                               stampmonth + stampyear + diff, data = edx)
+rmse_linear <- RMSE(predict(model_linear, newdata = final_holdout_test), final_holdout_test$rating)
+```
+
+## Random Forest
+
+```{r, eval = FALSE}
+control_knn <- trainControl(method = "repeatedcv", number = 5, repeats = 3)
+grid_knn <- expand.grid(mtry = seq(1,30,5))
+
+model_knn <- caret::train(rating ~ userId + movieId , data = edx %>% sample_n(10000), method = "rf",
+                   trControl = control_knn,
+                   tuneGrid = grid_knn)
+
+rmse_glmnet <- RMSE(predict(model_knn, newdata = final_holdout_test), final_holdout_test$rating)
+```
+
+## Gradient Boosting
+We will first fit a model without considering the genres predictor
+```{r}
+splitter <- function(dataset, outcome = "rating"){
+  predictors <- dataset %>% select(-outcome)  
+  predicted <- dataset %>% select(outcome)
+  return(list(predictors, predicted))
+}
+
+boost_train <- xgb.DMatrix(data = edx %>% select(movieId, userId, timestamp, 
+                                                 movieyear) %>% as.matrix, 
+                           label = edx %>% select(rating) %>% as.matrix)
+boost_test = xgb.DMatrix(data = final_holdout_test %>% select(movieId, userId, timestamp) %>%
+                     as.matrix,
+                     label = final_holdout_test %>% select(rating) %>% as.matrix)
+
+watchlist = list(train=boost_train, test=boost_test)
+
+model_boost <- xgb.train(data = boost_train, max.depth = 3, watchlist = watchlist,
+                         nrounds = 20)
+
+final_boost <- xgboost(data = boost_train, max.depth = 5, nrounds = 70, verbose = 1)
+
+rmse_boost1 <- RMSE(predict(final_boost, newdata = boost_test), final_holdout_test$rating)
+```
+
+We would like to use the genres predictor for the model but the XGBoost
+model only consider numerical variables. We have 3 options to encode the
+`genres` column:
+
+-   Target encoding : replaces a feature's categories with some number
+    derived from the target. We do a group aggregation and compute a
+    summary such as the mean
+
+-   One-hot encoding : convert each categorical value into a new
+    categorical column that is filled with 0 or 1.
+
+-   Label encoding : convert each categorical value into a unique
+    integer. The drawback is that the algorithm may interpret a
+    hierarchical order where there isn't.
+
+### Target Encoding
+
+```{r}
+edx %>% group_by(maingenres) %>% mutate(targetencode = mean(rating)) %>% ungroup()
+```
+
+### Label encoding
+
+```{r }
+edx %>% mutate(labelencode = as.numeric(maingenres)) %>% head
+```
+
+```{r}
+boost_train <- xgb.DMatrix(data = edx %>% mutate(labelencode = as.numeric(maingenres)) %>%
+                             select(movieId, userId, timestamp, labelencode,
+                                                 movieyear) %>% as.matrix, 
+                           label = edx %>% select(rating) %>% as.matrix)
+
+boost_test = xgb.DMatrix(data = final_holdout_test %>% mutate(labelencode = as.numeric(maingenres)) %>%
+                           select(movieId, userId, timestamp, labelencode, movieyear) %>%
+                     as.matrix,
+                     label = final_holdout_test %>% select(rating) %>% as.matrix)
+
+watchlist = list(train=boost_train, test=boost_test)
+
+model_boost <- xgb.train(data = boost_train, max.depth = 3, watchlist = watchlist,
+                         nrounds = 20)
+
+final_boost <- xgboost(data = boost_train, max.depth = 20, eta = 0.32, nrounds = 20, verbose = 1)
+
+rmse_boost1 <- RMSE(predict(final_boost, newdata = boost_test), final_holdout_test$rating)
+```
+
+### One-hot encoding
+
+```{r}
+edx %>% dummy_cols(select_columns = "maingenres")
+```
+
+
+
+
+
+## Recommenderlab Package
+
+```{r}
+train <- edx %>% select(rating, movieId, userId) %>%
+  pivot_wider(names_from = movieId, values_from = rating)
+
+r <- as(train, "realRatingMatrix")
+ 
+recommenderlab::Recommender(train, method = "UBCF")
+```
+
+### User Based Collaboration Filtering (UBCF)
+
+### Item Based Collaboration Filtering (IBCF)
+
+# 3. Modeling Results
+
+# 4. Conclusion
+
+# 5. References
+
+<https://www.kdnuggets.com/2019/05/sample-huge-dataset-machine-learning.html>
+<https://cran.r-project.org/web/packages/recommenderlab/vignettes/recommenderlab.pdf>
+<https://songxia-sophia.medium.com/two-machine-learning-algorithms-to-predict-xgboost-neural-network-with-entity-embedding-caac68717dea>
+<https://towardsdatascience.com/categorical-encoding-using-label-encoding-and-one-hot-encoder-911ef77fb5bd>
+<https://www.kaggle.com/code/ryanholbrook/target-encoding>
